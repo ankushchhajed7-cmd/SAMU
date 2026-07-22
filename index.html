@@ -219,13 +219,14 @@ const DEFAULT_SYS =
 - Helpful, seedhe aur honest raho. Jab chhota jawab kaafi ho toh chhota do; jab detail chahiye tabhi lambi baat karo.
 - Code do toh markdown code block mein do. Steps ke liye clean list use karo.
 - Pata na ho toh maan lo, galat confidently mat bolo.`;
-const FALLBACK_ORDER = ["gemini-2.5-flash","gemini-2.5-flash-lite","gemini-2.5-pro","gemini-3.5-flash"];
+let FALLBACK_ORDER = ["gemini-3.5-flash","gemini-3.1-flash-lite","gemini-flash-latest","gemini-2.5-flash","gemini-2.5-flash-lite"];
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
+const API_LIST = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /* ================= STATE ================= */
 const store = {
   key:  localStorage.getItem("samu_key")   || "",
-  model:localStorage.getItem("samu_model") || "gemini-2.5-flash",
+  model:localStorage.getItem("samu_model") || "gemini-3.5-flash",
   sys:  localStorage.getItem("samu_sys")   || DEFAULT_SYS,
   voice:localStorage.getItem("samu_voice") === "1",
 };
@@ -333,6 +334,56 @@ if(SR){
 function buildContents(){
   return messages.map(m=>({ role: m.role==="user"?"user":"model", parts:[{text:m.text}] }));
 }
+
+/* ---- auto-detect which models THIS key can actually use ---- */
+let availableModels = JSON.parse(localStorage.getItem("samu_models") || "[]");
+function rankModel(n){
+  let s=0; const v=parseFloat((n.match(/gemini-(\d+\.?\d*)/)||[])[1]||"0");
+  s += v*10;
+  if(/flash-lite/.test(n)) s+=4;
+  else if(/flash/.test(n)) s+=6;
+  else if(/pro/.test(n)) s+=2;
+  if(/preview|exp/.test(n)) s-=3;
+  if(/latest/.test(n)) s-=1;
+  return s;
+}
+async function fetchModels(){
+  if(!store.key) return null;
+  try{
+    const r=await fetch(API_LIST+"?pageSize=1000&key="+encodeURIComponent(store.key));
+    if(!r.ok) return null;
+    const d=await r.json();
+    let names=(d.models||[])
+      .filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent"))
+      .map(m=>m.name.replace("models/",""))
+      .filter(n=>/^gemini/i.test(n) && !/embedding|aqa|imagen|vision|tts|image|learnlm|nano-banana/i.test(n));
+    names=[...new Set(names)].filter(n=>/flash|pro/.test(n)).sort((a,b)=>rankModel(b)-rankModel(a));
+    if(!names.length) return null;
+    availableModels=names;
+    localStorage.setItem("samu_models",JSON.stringify(names));
+    FALLBACK_ORDER=names.slice();
+    // agar current model list mein nahi hai to best available pe switch
+    if(!names.includes(store.model)){ store.model=names[0]; localStorage.setItem("samu_model",store.model); modelChip.textContent=shortModel(store.model); }
+    populateModelSelect();
+    return names;
+  }catch(e){ return null; }
+}
+function prettyModel(n){ return n.replace("gemini-","Gemini ").replace(/-/g," "); }
+function populateModelSelect(){
+  const sel=$("modelSel"); if(!sel) return;
+  if(!availableModels.length) return;               // keep static list if we don't know yet
+  sel.innerHTML="";
+  availableModels.forEach((n,i)=>{
+    const o=document.createElement("option"); o.value=n;
+    o.textContent=prettyModel(n)+(i===0?"  (recommended)":"");
+    sel.appendChild(o);
+  });
+  sel.value = availableModels.includes(store.model) ? store.model : availableModels[0];
+}
+function isModelGone(status,msg){
+  return status===404 || /not available|not found|no longer available|not supported|update your code|deprecat|does not exist|unknown model/i.test(msg||"");
+}
+
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function isRetryable(status,msg){
   if([429,500,502,503,504].includes(status)) return true;
@@ -374,22 +425,29 @@ async function callGemini(onToken,onStatus){
   let lastStatus=0, lastMsg="";
   for(let mi=0; mi<order.length; mi++){
     const model=order[mi];
+    let goNext=false;
     for(let attempt=0; attempt<2; attempt++){
-      try{ return await attemptModel(model,onToken); }
+      try{
+        const out=await attemptModel(model,onToken);
+        if(model!==store.model){ store.model=model; localStorage.setItem("samu_model",model); }  // working model yaad rakho
+        return out;
+      }
       catch(e){
         if(e.name==="AbortError") throw e;
         lastStatus=e.status||0; lastMsg=e.message||String(e);
-        if(isRetryable(lastStatus,lastMsg)){
-          if(attempt===0){                     // same model: ek baar ruk ke retry
+        if(isModelGone(lastStatus,lastMsg)){        // ye model hai hi nahi — seedhe agle pe
+          goNext=true; break;
+        } else if(isRetryable(lastStatus,lastMsg)){
+          if(attempt===0){                          // same model: ek baar ruk ke retry
             onStatus && onStatus("Servers busy the — SAMU thodi der ruk ke retry kar raha hai… ⏳");
             await sleep(1600); continue;
-          } else break;                        // warna next model pe jao
+          } else { goNext=true; break; }             // warna next model pe jao
         } else {
           throw new Error(parseErr(lastStatus,lastMsg));  // key/permission jaisi galti — rukna
         }
       }
     }
-    if(mi<order.length-1){ onStatus && onStatus("Doosra model try kar raha hoon… 🔁"); await sleep(400); }
+    if(goNext && mi<order.length-1){ onStatus && onStatus("Doosra model try kar raha hoon… 🔁"); await sleep(300); }
   }
   throw new Error(parseErr(lastStatus,lastMsg));
 }
@@ -399,6 +457,7 @@ function parseErr(status,txt){
   if(status===400 && /api[_ ]?key|invalid key/i.test(msg)) return "API key galat lag rahi hai. ⚙️ Settings mein sahi Gemini key daalo (aistudio.google.com/apikey se).";
   if(status===429) return "Aaj ki free limit khatam lag rahi hai. Thodi der baad aana, ya ⚙️ Settings se Flash-Lite (zyada quota) pe switch karo.";
   if(status===403) return "Is key ko is model ki permission nahi. ⚙️ Settings se doosra model chuno.";
+  if(isModelGone(status,msg)) return "Ye model aapki key pe available nahi. ⚙️ Settings kholo — SAMU aapke available models khud laa raha hai, best wala chun lo.";
   if(isRetryable(status,msg)) return "Abhi Google ke free servers pe load zyada hai (temporary). SAMU ne retry + doosre models bhi try kiye. 10–20 sec baad neeche 'Dubara bhejo' dabao — chal jaayega. Ya Flash-Lite pe switch karo.";
   return "Kuch gadbad: "+msg;
 }
@@ -486,19 +545,24 @@ function closeAll(){ drawer.classList.remove("show"); settings.classList.remove(
 $("menuBtn").onclick=openDrawer; $("drawerClose").onclick=closeAll; $("setBtn").onclick=openSettings; scrim.onclick=closeAll;
 
 function fillSettings(){
-  $("keyInput").value=store.key; $("modelSel").value=store.model; $("sysInput").value=store.sys;
+  populateModelSelect();
+  $("keyInput").value=store.key; $("sysInput").value=store.sys;
+  $("modelSel").value = (!availableModels.length || availableModels.includes(store.model)) ? store.model : availableModels[0];
   $("voiceSwitch").classList.toggle("on",store.voice);
   updateKeyStatus(); refreshInstallUI();
+  if(store.key && !availableModels.length){ fetchModels().then(()=>{ $("modelSel").value=store.model; }); }
 }
 function updateKeyStatus(){ const s=$("keyStatus"); if(store.key){ s.textContent="✓ Key saved"; s.className="keystatus ok"; } else { s.textContent="✗ Koi key nahi — jawab ke liye key zaroori hai"; s.className="keystatus no"; } }
 function flashKey(){ const k=$("keyInput"); k.style.borderColor="var(--danger)"; setTimeout(()=>k.style.borderColor="",1500); }
 $("voiceSwitch").onclick=function(){ this.classList.toggle("on"); };
-$("saveBtn").onclick=()=>{
+$("saveBtn").onclick=async ()=>{
+  const oldKey=store.key;
   store.key=$("keyInput").value.trim(); store.model=$("modelSel").value; store.sys=$("sysInput").value.trim()||DEFAULT_SYS;
   store.voice=$("voiceSwitch").classList.contains("on");
   localStorage.setItem("samu_key",store.key); localStorage.setItem("samu_model",store.model);
   localStorage.setItem("samu_sys",store.sys); localStorage.setItem("samu_voice",store.voice?"1":"0");
   modelChip.textContent=shortModel(store.model); updateKeyStatus(); closeAll();
+  if(store.key && store.key!==oldKey){ availableModels=[]; localStorage.removeItem("samu_models"); await fetchModels(); }
 };
 function shortModel(m){ return m.replace("gemini-","").replace("-"," "); }
 
@@ -567,6 +631,7 @@ refreshInstallUI();
 modelChip.textContent=shortModel(store.model);
 renderChat();
 if("speechSynthesis" in window) speechSynthesis.getVoices();
+if(store.key) fetchModels();
 window.addEventListener("beforeunload",save);
 </script>
 </body>
