@@ -72,6 +72,8 @@
   .msgtools{display:flex; gap:6px; margin:6px 4px 0;}
   .msgtools button{font-size:11px; color:var(--muted); padding:3px 8px; border-radius:7px; border:1px solid transparent;}
   .msgtools button:hover{color:var(--ivory); border-color:var(--line);}
+  .retrybtn{align-self:flex-start; margin:8px 4px 0; font-size:13px; font-weight:700; color:#221a0a; background:var(--marigold); padding:8px 15px; border-radius:10px;}
+  .retrybtn:hover{filter:brightness(1.08);}
 
   /* typing dots */
   .dots{display:inline-flex; gap:5px; padding:4px 2px;}
@@ -331,58 +333,74 @@ if(SR){
 function buildContents(){
   return messages.map(m=>({ role: m.role==="user"?"user":"model", parts:[{text:m.text}] }));
 }
-async function callGemini(onToken){
-  const tried=new Set();
-  const order=[store.model, ...FALLBACK_ORDER].filter(m=>{ if(tried.has(m))return false; tried.add(m); return true; });
-  let lastErr=null;
-  for(const model of order){
-    try{
-      abortCtl=new AbortController();
-      const url=API_BASE+model+":streamGenerateContent?alt=sse&key="+encodeURIComponent(store.key);
-      const res=await fetch(url,{
-        method:"POST", signal:abortCtl.signal,
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          system_instruction:{parts:[{text:store.sys}]},
-          contents:buildContents(),
-          generationConfig:{temperature:0.85, maxOutputTokens:2048}
-        })
-      });
-      if(!res.ok){
-        const errTxt=await res.text();
-        if((res.status===429||res.status===503||res.status===404) && model!==order[order.length-1]){ lastErr=errTxt; continue; }
-        throw new Error(parseErr(res.status,errTxt));
-      }
-      const reader=res.body.getReader(), dec=new TextDecoder();
-      let buf="", full="";
-      while(true){
-        const {done,value}=await reader.read(); if(done)break;
-        buf+=dec.decode(value,{stream:true});
-        let nl;
-        while((nl=buf.indexOf("\n"))>=0){
-          const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
-          if(!line.startsWith("data:")) continue;
-          const js=line.slice(5).trim(); if(js==="[DONE]") continue;
-          try{ const o=JSON.parse(js);
-            const parts=o.candidates?.[0]?.content?.parts||[];
-            for(const p of parts){ if(p.text){ full+=p.text; onToken(full,model); } }
-          }catch(_){}
-        }
-      }
-      return full;
-    }catch(e){
-      if(e.name==="AbortError") throw e;
-      lastErr=e.message||String(e);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function isRetryable(status,msg){
+  if([429,500,502,503,504].includes(status)) return true;
+  return /overload|high demand|unavailable|try again later|internal error|deadline|temporarily/i.test(msg||"");
+}
+async function attemptModel(model,onToken){
+  abortCtl=new AbortController();
+  const url=API_BASE+model+":streamGenerateContent?alt=sse&key="+encodeURIComponent(store.key);
+  const res=await fetch(url,{
+    method:"POST", signal:abortCtl.signal, headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      system_instruction:{parts:[{text:store.sys}]},
+      contents:buildContents(),
+      generationConfig:{temperature:0.85, maxOutputTokens:2048}
+    })
+  });
+  if(!res.ok){ const t=await res.text(); const err=new Error(errMsgOf(t)); err.status=res.status; throw err; }
+  const reader=res.body.getReader(), dec=new TextDecoder();
+  let buf="", full="";
+  while(true){
+    const {done,value}=await reader.read(); if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let nl;
+    while((nl=buf.indexOf("\n"))>=0){
+      const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
+      if(!line.startsWith("data:")) continue;
+      const js=line.slice(5).trim(); if(js==="[DONE]") continue;
+      let o; try{ o=JSON.parse(js); }catch(_){ continue; }
+      if(o.error){ const err=new Error(o.error.message||"error"); err.status=o.error.code||503; throw err; }
+      const parts=o.candidates?.[0]?.content?.parts||[];
+      for(const p of parts){ if(p.text){ full+=p.text; onToken(full,model); } }
     }
   }
-  throw new Error(lastErr||"Kuch gadbad ho gayi.");
+  return full;
 }
+async function callGemini(onToken,onStatus){
+  const tried=new Set();
+  const order=[store.model, ...FALLBACK_ORDER].filter(m=>{ if(tried.has(m))return false; tried.add(m); return true; });
+  let lastStatus=0, lastMsg="";
+  for(let mi=0; mi<order.length; mi++){
+    const model=order[mi];
+    for(let attempt=0; attempt<2; attempt++){
+      try{ return await attemptModel(model,onToken); }
+      catch(e){
+        if(e.name==="AbortError") throw e;
+        lastStatus=e.status||0; lastMsg=e.message||String(e);
+        if(isRetryable(lastStatus,lastMsg)){
+          if(attempt===0){                     // same model: ek baar ruk ke retry
+            onStatus && onStatus("Servers busy the — SAMU thodi der ruk ke retry kar raha hai… ⏳");
+            await sleep(1600); continue;
+          } else break;                        // warna next model pe jao
+        } else {
+          throw new Error(parseErr(lastStatus,lastMsg));  // key/permission jaisi galti — rukna
+        }
+      }
+    }
+    if(mi<order.length-1){ onStatus && onStatus("Doosra model try kar raha hoon… 🔁"); await sleep(400); }
+  }
+  throw new Error(parseErr(lastStatus,lastMsg));
+}
+function errMsgOf(txt){ try{ return JSON.parse(txt).error?.message||txt; }catch(_){ return txt; } }
 function parseErr(status,txt){
-  let msg=txt; try{ msg=JSON.parse(txt).error?.message||txt; }catch(_){}
-  if(status===400 && /API key/i.test(msg)) return "API key galat lag rahi hai. Settings mein sahi Gemini key daalo.";
-  if(status===429) return "Free limit hit ho gayi. Thodi der baad try karo ya Flash-Lite model pe switch karo.";
-  if(status===403) return "Key ko is model ki permission nahi. Doosra model try karo.";
-  return "Error: "+msg;
+  const msg=errMsgOf(txt);
+  if(status===400 && /api[_ ]?key|invalid key/i.test(msg)) return "API key galat lag rahi hai. ⚙️ Settings mein sahi Gemini key daalo (aistudio.google.com/apikey se).";
+  if(status===429) return "Aaj ki free limit khatam lag rahi hai. Thodi der baad aana, ya ⚙️ Settings se Flash-Lite (zyada quota) pe switch karo.";
+  if(status===403) return "Is key ko is model ki permission nahi. ⚙️ Settings se doosra model chuno.";
+  if(isRetryable(status,msg)) return "Abhi Google ke free servers pe load zyada hai (temporary). SAMU ne retry + doosre models bhi try kiye. 10–20 sec baad neeche 'Dubara bhejo' dabao — chal jaayega. Ya Flash-Lite pe switch karo.";
+  return "Kuch gadbad: "+msg;
 }
 
 /* ================= SEND ================= */
@@ -396,24 +414,34 @@ async function send(){
   const text=input.value.trim();
   if(!text) return;
   if(!store.key){ openSettings(); flashKey(); return; }
-
   messages.push({role:"user",text});
-  input.value=""; grow();
-  renderChat();
-
+  input.value=""; grow(); renderChat();
+  await generate();
+}
+async function generate(){
+  if(busy) return;
   busy=true; setSendMode(true);
   const aiWrap=bubble("assistant","",messages.length);
-  aiWrap.querySelector(".bubble").innerHTML='<div class="dots"><i></i><i></i><i></i></div>';
-  chat.appendChild(aiWrap); scrollDown();
   const bub=aiWrap.querySelector(".bubble");
+  const dots='<div class="dots"><i></i><i></i><i></i></div>';
+  bub.innerHTML=dots;
+  chat.appendChild(aiWrap); scrollDown();
 
   let answer="";
   try{
-    answer=await callGemini((full,model)=>{ answer=full; bub.innerHTML=renderMD(full); scrollDown();
-      if(model!==store.model){ modelChip.textContent="↳ "+shortModel(model); } });
+    answer=await callGemini(
+      (full,model)=>{ answer=full; bub.innerHTML=renderMD(full); scrollDown();
+        if(model!==store.model){ modelChip.textContent="↳ "+shortModel(model); } },
+      (note)=>{ bub.innerHTML=dots+'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">'+note+'</div>'; scrollDown(); }
+    );
   }catch(e){
     if(e.name==="AbortError"){ bub.innerHTML= answer? renderMD(answer) : '<em style="color:var(--muted)">Ruk gaya.</em>'; }
-    else{ bub.innerHTML='<span style="color:var(--danger)">'+esc(e.message)+'</span>'; }
+    else{
+      bub.innerHTML='<span style="color:var(--danger)">'+esc(e.message)+'</span>';
+      const rb=document.createElement("button"); rb.className="retrybtn"; rb.innerHTML="&#8635; Dubara bhejo";
+      rb.onclick=()=>{ aiWrap.remove(); generate(); };
+      aiWrap.appendChild(rb);
+    }
   }
   busy=false; setSendMode(false); abortCtl=null;
 
